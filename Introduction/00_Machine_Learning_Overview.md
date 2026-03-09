@@ -241,6 +241,170 @@ Finding the right model complexity is one of the central challenges of applied M
 
 ---
 
+## LLM Math in Practice
+
+The following examples trace the actual arithmetic that runs inside a transformer at each stage, using small numbers to keep the calculations readable. Real LLMs use the same operations at larger scale.
+
+---
+
+### Step 1 — Token Embedding (Linear Algebra)
+
+Every word (token) is converted to a vector by looking it up in a learned embedding matrix `E`.
+
+```
+Vocabulary size:   V = 5   (tokens: ["cat", "sat", "on", "the", "mat"])
+Embedding dim:     d = 3
+
+Embedding matrix E  (shape 5 × 3):
+         d0     d1     d2
+"cat"  [ 0.9,  0.1, -0.4 ]
+"sat"  [ 0.2,  0.8,  0.3 ]
+"on"   [-0.1,  0.5,  0.7 ]
+"the"  [ 0.0, -0.3,  0.9 ]
+"mat"  [ 0.8,  0.2, -0.5 ]
+
+Input token: "cat"  →  one-hot vector:  x = [1, 0, 0, 0, 0]
+
+Embedding lookup = x · E = [0.9, 0.1, -0.4]
+```
+
+This is just a row-selection — a dot product of a one-hot vector with `E`. The embedding vector `[0.9, 0.1, -0.4]` is the learned representation of "cat" that the rest of the network will process.
+
+---
+
+### Step 2 — Attention Score (Dot Product + Softmax)
+
+Attention decides how much each token should "look at" every other token. For a single attention head:
+
+```
+Each token gets three vectors derived from its embedding:
+  Q (query)  — what am I looking for?
+  K (key)    — what do I contain?
+  V (value)  — what do I contribute?
+
+Sequence: ["cat", "sat"]
+Q_cat = [1.0,  0.0]
+K_cat = [1.0,  0.0]
+K_sat = [0.5,  1.0]
+V_cat = [0.8, -0.1]
+V_sat = [0.2,  0.9]
+
+Scaling factor: √d_k = √2 ≈ 1.41
+
+Raw attention scores for "cat" attending to each token:
+  score(cat→cat) = Q_cat · K_cat / √d_k = (1×1 + 0×0) / 1.41 = 0.71
+  score(cat→sat) = Q_cat · K_sat / √d_k = (1×0.5 + 0×1) / 1.41 = 0.35
+
+Softmax converts scores to weights that sum to 1:
+  exp(0.71) ≈ 2.03,   exp(0.35) ≈ 1.42
+  weights = [2.03, 1.42] / (2.03 + 1.42) = [0.59, 0.41]
+
+Attention output for "cat" = 0.59 × V_cat + 0.41 × V_sat
+  = 0.59×[0.8, -0.1] + 0.41×[0.2, 0.9]
+  = [0.47, -0.06] + [0.08,  0.37]
+  = [0.55, 0.31]
+```
+
+The token "cat" now carries a blend of its own information (59%) and "sat"'s information (41%). This is how context flows between tokens.
+
+---
+
+### Step 3 — Feed-Forward Layer (Matrix Multiply + Activation)
+
+After attention, each token passes through a small feed-forward network independently:
+
+```
+Input:          h = [0.55, 0.31]       (attention output for "cat")
+Weight matrix:  W = [[ 1.0, -0.5],
+                     [ 0.3,  0.8],
+                     [-0.7,  1.2]]     (shape: 3 × 2)
+Bias:           b = [0.1, -0.2, 0.0]
+
+Linear step:    z = W · h + b
+  z[0] = 1.0×0.55 + (-0.5)×0.31 + 0.1 =  0.55 - 0.155 + 0.1 =  0.495
+  z[1] = 0.3×0.55 +   0.8×0.31 - 0.2 =  0.165 + 0.248 - 0.2 =  0.213
+  z[2] = (-0.7)×0.55 + 1.2×0.31 + 0.0 = -0.385 + 0.372       = -0.013
+
+Activation (ReLU — zero out negatives):
+  ReLU(z) = [0.495, 0.213, 0.0]
+```
+
+The network learns which features to amplify and which to suppress. Stacking many such layers is what gives transformers their representational power.
+
+---
+
+### Step 4 — Next-Token Prediction (Softmax over Vocabulary)
+
+The final hidden state is projected to logits over the full vocabulary, then normalized:
+
+```
+Vocabulary: ["cat", "sat", "on", "the", "mat"]   (V = 5)
+Final hidden state for last token: h = [0.5, 0.3, 0.0]
+
+Output projection W_out  (shape: 5 × 3):
+  "cat" row: [ 0.2,  0.1, -0.3]  →  logit = 0.5×0.2 + 0.3×0.1 + 0.0×(-0.3) = 0.13
+  "sat" row: [ 0.4,  0.6,  0.1]  →  logit = 0.5×0.4 + 0.3×0.6 + 0.0×0.1    = 0.38
+  "on"  row: [-0.1,  0.9,  0.5]  →  logit = 0.5×(-0.1)+ 0.3×0.9            = 0.22
+  "the" row: [ 0.0, -0.2,  0.8]  →  logit = 0.5×0.0  + 0.3×(-0.2)          = -0.06
+  "mat" row: [ 0.7,  0.3, -0.1]  →  logit = 0.5×0.7  + 0.3×0.3             = 0.44
+
+Logits: [0.13, 0.38, 0.22, -0.06, 0.44]
+
+Softmax probabilities:
+  exp values: [1.14, 1.46, 1.25, 0.94, 1.55]   (sum ≈ 6.34)
+  P("cat")  = 1.14 / 6.34 ≈ 0.18
+  P("sat")  = 1.46 / 6.34 ≈ 0.23
+  P("on")   = 1.25 / 6.34 ≈ 0.20
+  P("the")  = 0.94 / 6.34 ≈ 0.15
+  P("mat")  = 1.55 / 6.34 ≈ 0.24   ← highest probability
+```
+
+The model predicts "mat" as the most likely next token.
+
+---
+
+### Step 5 — Loss Computation (Cross-Entropy)
+
+If the correct next token is "mat" (index 4), the loss for this one prediction is:
+
+```
+Cross-entropy loss = -log P(correct token)
+                   = -log(0.24)
+                   ≈ 1.43
+
+Perfect prediction would give:  -log(1.0) = 0.0
+Random guess (uniform) would give:  -log(0.2) ≈ 1.61
+```
+
+Training minimizes this loss by backpropagating gradients through every weight in Steps 1–4. After billions of such updates, the model's weights encode statistical patterns of language.
+
+---
+
+### Step 6 — Weight Update (Gradient Descent)
+
+After backpropagation computes `∂J/∂w` for every weight, Adam updates each one:
+
+```
+Suppose one weight w = 0.40 has gradient ∂J/∂w = 0.12.
+
+Adam state (after many steps, bias-corrected):
+  m̂ = 0.11    (smoothed gradient estimate)
+  v̂ = 0.015   (smoothed squared gradient estimate)
+
+Learning rate:  α = 0.001,   ε = 1e-8
+
+Update:
+  w := w - α × m̂ / (√v̂ + ε)
+     = 0.40 - 0.001 × 0.11 / (√0.015 + 1e-8)
+     = 0.40 - 0.001 × 0.11 / 0.122
+     = 0.40 - 0.0009
+     = 0.3991
+```
+
+The weight moved by ~0.0009 — a tiny step in the direction that reduces loss. Repeat across every weight, across every token, across billions of training examples.
+
+---
+
 ## How ML Connects to LLMs
 
 Large Language Models are machine learning models — the same principles apply at every scale:
